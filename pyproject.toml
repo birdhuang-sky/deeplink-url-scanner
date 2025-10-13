@@ -1,0 +1,21 @@
+[project]
+name = "org-scanner"
+version = "0.1.0"
+description = "Scan GitHub org repositories for deeplink parameter parsing usage."
+authors = [{name="Your Name", email="you@example.com"}]
+requires-python = ">=3.11"
+dependencies = [
+  "aiohttp>=3.9.0",
+  "pyyaml>=6.0.0",
+  "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "ruff", "mypy"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
