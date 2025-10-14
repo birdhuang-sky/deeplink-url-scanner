@@ -99,7 +99,7 @@ def list_repos(org,tok):
     return out
 
 def search_repo(repo, query, tok, limiter:RateLimiter|None=None, retries:int=3, backoff_base:float=1.6):
-    q=f"repo:{repo} {query} in:file fork:true"
+    q=f"repo:{repo} {query} in:file"
     params={"q":q,"per_page":5,"page":1}
     for attempt in range(retries+1):
         if limiter:
@@ -157,11 +157,11 @@ def parse_args():
     p.add_argument("--org",default="skyscanner")
     p.add_argument("--query",default='"deeplink_url"')
     p.add_argument("--token",default=os.getenv("GITHUB_TOKEN"))
-    p.add_argument("--out",default="repos_with_keyword.csv")
-    p.add_argument("--max-pages",type=int,default=10)
-    p.add_argument("--max-repos",type=int,default=300, help="Scan at most this many repos in fallback mode (0=all)")
-    p.add_argument("--workers",type=int,default=12, help="Concurrent workers for fallback per-repo scans")
-    p.add_argument("--rate",type=int,default=10, help="Max code_search requests per minute (GitHub default ~10)")
+    p.add_argument("--out",default="results/repos_with_keyword.csv")
+    p.add_argument("--max-pages",type=int,default=1000)
+    p.add_argument("--max-repos",type=int,default=500, help="Scan at most this many repos in fallback mode (0=all)")
+    p.add_argument("--workers",type=int,default=4, help="Concurrent workers for fallback per-repo scans")
+    p.add_argument("--rate",type=int,default=4, help="Max code_search requests per minute (GitHub default ~10)")
     p.add_argument("--sleep",type=float,default=0.0, help="Unused when workers>1 (kept for backward compat)")
     p.add_argument("--base-url", default=os.getenv("GITHUB_BASE_URL","https://api.github.com"), help="REST API base or web origin. Examples: https://api.github.com OR https://github.skyscannertools.net")
     p.add_argument("--insecure", action="store_true", help="Disable TLS verification (NOT recommended)")
