@@ -1,4 +1,3 @@
-# 额外匹配的参数（每行一个）；可按需增删
 _gl
 advertising_id
 auid

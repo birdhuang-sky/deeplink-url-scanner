@@ -10,6 +10,7 @@ from org_scanner.repo_filter import ExcludeRepoFilter
 
 API_BASE = "https://api.github.com"   # may be changed at runtime via --base-url
 VERIFY: bool | str = True              # requests verify flag (bool or CA path)
+EXCLUDE_FILE_TYPE_LIST = ['PROTO']
 
 @dataclass
 class Hit:
@@ -50,10 +51,24 @@ def _search_endpoint():
 def _org_repos_endpoint(org:str):
     return f"{API_BASE}/orgs/{org}/repos"
 
+# def ensure_exact(q: str) -> str:
+#     if ('"' not in q) and any(c in q for c in "_-. "):
+#         return f'"{q}"'
+#     return q
+
+def is_file_type_excluded(path: str) -> bool:
+    ext = path.rsplit('.', 1)[-1].upper() if '.' in path else ''
+    is_exclude = ext in EXCLUDE_FILE_TYPE_LIST
+    if( is_exclude ):
+        print(f"is_file_type_excluded: {path} -> {is_exclude}", file=sys.stderr)
+    return is_exclude
+
 def search_org(org, query, tok, max_pages=10):
     hits=[]
     session=requests.Session()
+    # query = ensure_exact(query)
     q=f"org:{org} {query} in:file"
+    print(f"q = {q}", file=sys.stderr)
     for page in range(1,max_pages+1):
         r=session.get(_search_endpoint(), params={"q":q,"per_page":100,"page":page},
                       headers=headers(tok), timeout=30, verify=VERIFY)
@@ -65,6 +80,8 @@ def search_org(org, query, tok, max_pages=10):
             print(f"[org-search] total_count={data.get('total_count')}",file=sys.stderr)
         items=data.get("items",[])
         for it in items:
+            if is_file_type_excluded(it["path"]):
+                continue
             repo=it["repository"]["full_name"]; path=it["path"]; url=it["html_url"]
             hits.append(Hit(repo,path,url))
         if len(items)<100: break
@@ -160,7 +177,7 @@ def parse_args():
 
 def main():
     global API_BASE, VERIFY
-    a=parse_args()
+    a = parse_args()
 
     # TLS settings
     VERIFY = True
@@ -172,35 +189,52 @@ def main():
     # API base normalization (GHES)
     API_BASE = normalize_api_base(a.base_url)
 
-    tok=a.token
+    tok = a.token
     if not tok:
-        print("Missing GITHUB_TOKEN",file=sys.stderr)
+        print("Missing GITHUB_TOKEN", file=sys.stderr)
 
-    # 1️⃣ org-level search
-    hits=search_org(a.org,a.query,tok,a.max_pages)
-    if not hits:
-        print("[fallback] org search empty; scanning repos individually…",file=sys.stderr)
-        repos=list_repos(a.org,tok)
-        if a.max_repos and len(repos)>a.max_repos:
-            repos=repos[:a.max_repos]
-        limiter=RateLimiter(limit=max(1,a.rate), window=60)
-        results=[]
-        with ThreadPoolExecutor(max_workers=max(1,a.workers)) as ex:
-            futs={ex.submit(search_repo, r, a.query, tok, limiter): r for r in repos}
-            for i,f in enumerate(as_completed(futs),1):
-                repo=futs[f]
+    # Load exclude filter once
+    exclude_filter = ExcludeRepoFilter(Path(a.exclude_file))
+
+    # Org-level search
+    hits = search_org(a.org, a.query, tok, a.max_pages)
+
+    if hits:
+        before = len(hits)
+        hits = [h for h in hits if not exclude_filter.is_excluded(h.repo)]
+        after = len(hits)
+        if after != before:
+            print(f"[exclude] org-search hits: {before} -> {after} after applying exclude list ({a.exclude_file})",
+                  file=sys.stderr)
+    else:
+        print("[fallback] org search empty; scanning repos individually…", file=sys.stderr)
+        repos = list_repos(a.org, tok)
+        total_before = len(repos)
+        repos = exclude_filter.filter(repos)
+        print(f"[exclude] repos: {total_before} -> {len(repos)} after applying exclude list ({a.exclude_file})",
+              file=sys.stderr)
+        if a.max_repos and len(repos) > a.max_repos:
+            repos = repos[:a.max_repos]
+            print(f"[limit] truncated to first {len(repos)} repos due to --max-repos", file=sys.stderr)
+        limiter = RateLimiter(limit=max(1, a.rate), window=60)
+        results = []
+        with ThreadPoolExecutor(max_workers=max(1, a.workers)) as ex:
+            futs = {ex.submit(search_repo, r, a.query, tok, limiter): r for r in repos}
+            for i, f in enumerate(as_completed(futs), 1):
+                repo = futs[f]
                 try:
-                    res=f.result(); results.extend(res)
+                    res = f.result(); results.extend(res)
                 except Exception as e:
-                    print(f"[repo-search] {repo} raised {e}",file=sys.stderr)
-                if i%25==0 or i==len(futs):
-                    print(f"[progress] {i}/{len(futs)} repos scanned",file=sys.stderr)
-        hits=results
-    rows=aggregate(hits)
-    write_csv(rows,a.out)
+                    print(f"[repo-search] {repo} raised {e}", file=sys.stderr)
+                if i % 25 == 0 or i == len(futs):
+                    print(f"[progress] {i}/{len(futs)} repos scanned", file=sys.stderr)
+        hits = results
+
+    rows = aggregate(hits)
+    write_csv(rows, a.out)
     print(f"Found {len(rows)} repos; written to {a.out}")
-    print("| Repo | Matches | Samples ||---|---:|---|")
-    for r,c,u in rows[:40]:
-        print(f"| {r} | {c} | {'<br/>'.join(u)} |")
+    # print("| Repo | Matches | Samples ||---|---:|---|")
+    # for r, c, u in rows[:40]:
+    #     print(f"| {r} | {c} | {'<br/>'.join(u)} |")
 
 if __name__=="__main__": main()
