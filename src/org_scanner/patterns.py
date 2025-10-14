@@ -5,8 +5,10 @@ PARAM_LITERAL_RE = re.compile(r'["\\\'](utm_[a-zA-Z0-9_]+|[a-zA-Z0-9]*_id|associ
 
 LANG_PATTERNS = {
     "js_urlsearchparams": re.compile(r'searchParams\\.get\\((["\\\'])([^"\\\']+)\\1\\)'),
-    "python_parse_qs": re.compile(r'parse_qs\\([^\\n]+["\\\']([a-zA-Z0-9_]+)["\\\']'),
-    "python_dict_access": re.compile(r'\\[["\\\'](utm_[a-zA-Z0-9_]+|associate_id)["\\\']\\]'),
+    "python_parse_qs": re.compile(r'parse_qs\([^\n]*["\']([a-zA-Z0-9_]+)["\']'),
+    "python_dict_access": re.compile(
+        r'\[["\'](utm_[A-Za-z0-9_]+|associate_id|associateid|associateId|associateID)["\']\]'
+    ),
     "java_uri": re.compile(r'getQueryParameter\\((["\\\'])([^"\\\']+)\\1\\)'),
     "swift_queryitems": re.compile(r'name\\s*==\\s*\\"([^\\"]+)\\"'),
     "go_query_get": re.compile(r'Query\\(\\)\\.Get\\((["\\\'])([^"\\\']+)\\1\\)'),
