@@ -69,7 +69,7 @@ def _org_repos_endpoint(org:str):
 def search_org(org, query, tok, max_pages=10):
     hits=[]
     session=requests.Session()
-    q=f"org:{org} {query} in:file fork:true"
+    q=f"org:{org} {query} in:file"
     for page in range(1,max_pages+1):
         r=session.get(_search_endpoint(), params={"q":q,"per_page":100,"page":page},
                       headers=headers(tok), timeout=30, verify=VERIFY)
