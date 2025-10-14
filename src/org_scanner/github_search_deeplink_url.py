@@ -1,28 +1,12 @@
+# src/org_scanner/github_search_deeplink_url.py
 #!/usr/bin/env python3
-"""
-Search all repositories under an org (e.g. skyscanner) for code containing a keyword.
-Falls back to per-repo REST searches when org-level search returns 0.
-
-Now supports GitHub Enterprise Server (GHES), e.g.:
-  --base-url https://github.skyscannertools.net
-(we'll automatically use /api/v3 under the hood)
-
-Also supports:
-- --max-repos: stop after scanning N repos in fallback mode
-- --workers: concurrent per-repo scans with a global rate limiter
-- --rate: max code_search requests per minute (default 10)
-- --insecure / --ca-bundle for custom TLS
-
-Usage examples:
-  python github_search_deeplink_url.py --org skyscanner --query '"deeplink_url"'
-  python github_search_deeplink_url.py --org skyscanner --query '"deeplink_url"' \
-      --base-url https://github.skyscannertools.net --max-repos 300 --workers 12 --rate 10
-"""
 import argparse, csv, os, sys, time, requests, threading, urllib.parse
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
+from pathlib import Path
+from org_scanner.repo_filter import ExcludeRepoFilter
 
 API_BASE = "https://api.github.com"   # may be changed at runtime via --base-url
 VERIFY: bool | str = True              # requests verify flag (bool or CA path)
@@ -159,13 +143,17 @@ def parse_args():
     p.add_argument("--token",default=os.getenv("GITHUB_TOKEN"))
     p.add_argument("--out",default="results/repos_with_keyword.csv")
     p.add_argument("--max-pages",type=int,default=1000)
-    p.add_argument("--max-repos",type=int,default=500, help="Scan at most this many repos in fallback mode (0=all)")
-    p.add_argument("--workers",type=int,default=4, help="Concurrent workers for fallback per-repo scans")
-    p.add_argument("--rate",type=int,default=4, help="Max code_search requests per minute (GitHub default ~10)")
-    p.add_argument("--sleep",type=float,default=0.0, help="Unused when workers>1 (kept for backward compat)")
-    p.add_argument("--base-url", default=os.getenv("GITHUB_BASE_URL","https://api.github.com"), help="REST API base or web origin. Examples: https://api.github.com OR https://github.skyscannertools.net")
+    p.add_argument("--max-repos", type=int, default=500, help="Scan at most this many repos in fallback mode (0=all)")
+    p.add_argument("--workers", type=int, default=4, help="Concurrent workers for fallback per-repo scans")
+    p.add_argument("--rate", type=int, default=4, help="Max code_search requests per minute (GitHub default ~10)")
+    p.add_argument("--sleep", type=float, default=0.0, help="Unused when workers>1 (kept for backward compat)")
+    p.add_argument("--base-url", default=os.getenv("GITHUB_BASE_URL", "https://api.github.com"),
+                   help="REST API base or web origin. Examples: https://api.github.com OR https://github.skyscannertools.net")
     p.add_argument("--insecure", action="store_true", help="Disable TLS verification (NOT recommended)")
-    p.add_argument("--ca-bundle", default=os.getenv("GIT_SSL_CAINFO",""), help="Path to custom CA bundle for corporate proxies")
+    p.add_argument("--ca-bundle", default=os.getenv("GIT_SSL_CAINFO", ""),
+                   help="Path to custom CA bundle for corporate proxies")
+    p.add_argument("--exclude-file", default="res/exclude-repo.txt",
+                   help="Path to repo exclusion list (one pattern per line)")
 
     print(f"base-url: {p.parse_args().base_url}", file=sys.stderr)
     return p.parse_args()
