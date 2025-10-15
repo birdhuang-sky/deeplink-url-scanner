@@ -113,6 +113,24 @@ def load_keywords(path: Path) -> list[str]:
     print(f"[keywords] loaded {len(kws)} keywords from {path}", file=sys.stderr)
     return kws
 
+def preload_repo_set(path: Path) -> set[str]:
+    """Load pre-specified repos (one per line) to skip initial org search."""
+    if not path.exists():
+        print(f"[preload] path {path} not exist.", file=sys.stderr)
+        return set()
+    # FIX: avoid walrus inside comprehension (SyntaxError in this context)
+    repos = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        repos.add(line)
+    if repos:
+        print(f"[preload] loaded {len(repos)} repos from {path}; skipping org search", file=sys.stderr)
+    else:
+        print(f"[preload] file {path} empty; proceeding with normal org search", file=sys.stderr)
+    return repos
+
 def keyword_query_fragment(kw: str) -> str:
     # Quote keyword if it contains spaces or special chars
     if any(c.isspace() for c in kw) or any(c in kw for c in '"\''):
@@ -321,27 +339,39 @@ def main():
     # Load exclude filter once
     exclude_filter = ExcludeRepoFilter(Path(args.exclude_file))
 
-    # Org-level search
-    hits = search_org(args.org, args.query, tok, args.max_pages)
+    preload_file = Path(args.out)
+    repo_set = preload_repo_set(preload_file)
+    preloaded = bool(repo_set)
 
-    if hits:
-        before = len(hits)
-        hits = [h for h in hits if not exclude_filter.is_excluded(h.repo)]
-        after = len(hits)
+    if preloaded:
+        before = len(repo_set)
+        repo_set = {r for r in repo_set if not exclude_filter.is_excluded(r)}
+        after = len(repo_set)
         if after != before:
-            print(f"[exclude] org-search hits: {before} -> {after} after applying exclude list ({args.exclude_file})",
+            print(f"[exclude] preload repos: {before} -> {after} after applying exclude list ({args.exclude_file})",
                   file=sys.stderr)
-        repo_set = {h.repo for h in hits}
+        hits = []  # no org search hits
     else:
-        hits, repos = fallback_after_search_org_fail(args, exclude_filter, tok)
-        repo_set = set(repos)
+        # Org-level search (original path)
+        hits = search_org(args.org, args.query, tok, args.max_pages)
+        if hits:
+            before = len(hits)
+            hits = [h for h in hits if not exclude_filter.is_excluded(h.repo)]
+            after = len(hits)
+            if after != before:
+                print(f"[exclude] org-search hits: {before} -> {after} after applying exclude list ({args.exclude_file})",
+                      file=sys.stderr)
+            repo_set = {h.repo for h in hits}
+        else:
+            hits, repos = fallback_after_search_org_fail(args, exclude_filter, tok)
+            repo_set = set(repos)
 
-    rows = aggregate(hits)
-    write_csv(rows, args.out)
-    print(f"Found {len(rows)} repos; written to {args.out}")
-    # print("| Repo | Matches | Samples ||---|---:|---|")
-    # for r, c, u in rows[:40]:
-    #     print(f"| {r} | {c} | {'<br/>'.join(u)} |")
+    if not preloaded:
+        rows = aggregate(hits)
+        write_csv(rows, args.out)
+        print(f"Found {len(rows)} repos; written to {args.out}")
+    else:
+        print(f"[preload] skipping writing {args.out} (no fresh search performed)", file=sys.stderr)
 
     scan_keywords(args, tok, repo_set)
 
