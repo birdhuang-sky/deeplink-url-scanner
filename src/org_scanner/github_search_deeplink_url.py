@@ -1,6 +1,6 @@
 # src/org_scanner/github_search_deeplink_url.py
 #!/usr/bin/env python3
-import argparse, csv, os, sys, time, requests, threading, urllib.parse
+import argparse, csv, os, sys, time, requests, threading, urllib.parse, hashlib, re
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -114,17 +114,25 @@ def load_keywords(path: Path) -> list[str]:
     return kws
 
 def preload_repo_set(path: Path) -> set[str]:
-    """Load pre-specified repos (one per line) to skip initial org search."""
+    """Load pre-specified repos (one per line) OR from a CSV produced earlier.
+    Accept lines like:
+      repo_name
+      repo_name,3,url1 | url2
+    Only the first comma-separated field is treated as the repo.
+    """
     if not path.exists():
         print(f"[preload] path {path} not exist.", file=sys.stderr)
         return set()
-    # FIX: avoid walrus inside comprehension (SyntaxError in this context)
-    repos = set()
+    repos: set[str] = set()
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        repos.add(line)
+        # If CSV header or malformed, skip
+        first_field = line.split(",", 1)[0]
+        if first_field.lower() == "repo":
+            continue
+        repos.add(first_field)
     if repos:
         print(f"[preload] loaded {len(repos)} repos from {path}; skipping org search", file=sys.stderr)
     else:
@@ -137,7 +145,8 @@ def keyword_query_fragment(kw: str) -> str:
         return f'"{kw}"'
     return kw
 
-def repo_has_keyword(repo: str, kw: str, tok: str | None, limiter: RateLimiter | None) -> bool:
+def repo_keyword_hits(repo: str, kw: str, tok: str | None, limiter: RateLimiter | None) -> int:
+    """Return total_count hits for keyword in repo (0 if none, -1 on hard error)."""
     q = f"repo:{repo} {keyword_query_fragment(kw)} in:file"
     params = {"q": q, "per_page": 1, "page": 1}
     if limiter:
@@ -146,22 +155,23 @@ def repo_has_keyword(repo: str, kw: str, tok: str | None, limiter: RateLimiter |
         r = requests.get(_search_endpoint(), params=params, headers=headers(tok), timeout=30, verify=VERIFY)
     except requests.RequestException as e:
         print(f"[kw-check] {repo} '{kw}' network error: {e}", file=sys.stderr)
-        return False
+        return -1
     if r.status_code == 200:
         data = r.json()
-        print(f"[kw-check] {repo} '{kw}' -> {data.get('total_count', 0)} hits", file=sys.stderr)
-        return bool(data.get("items"))
+        hits = int(data.get("total_count", 0) or 0)
+        print(f"[kw-check] {repo} '{kw}' -> {hits} hits", file=sys.stderr)
+        return hits
     if r.status_code in (429, 500, 502, 503, 504):
-        # Simple single retry after short sleep
         time.sleep(1.2)
-        return repo_has_keyword(repo, kw, tok, limiter)
-    return False
+        return repo_keyword_hits(repo, kw, tok, limiter)
+    print(f"[kw-check] {repo} '{kw}' HTTP {r.status_code}", file=sys.stderr)
+    return -1
 
 def detect_keywords_in_repo(repo: str, keywords: list[str], tok: str | None,
                             limiter: RateLimiter, max_keywords: int | None = None) -> list[str]:
     matched = []
     for kw in keywords:
-        if repo_has_keyword(repo, kw, tok, limiter):
+        if repo_keyword_hits(repo, kw, tok, limiter) > 0:
             matched.append(kw)
             if max_keywords and len(matched) >= max_keywords:
                 break
@@ -173,6 +183,53 @@ def write_repo_keywords_csv(rows: list[tuple[str, list[str]]], out_path: str):
         w.writerow(["repo", "keywords"])
         for repo, kws in rows:
             w.writerow([repo, " | ".join(kws)])
+
+# --- added: per-repo keyword state persistence helpers ---
+def load_repo_keyword_state(fn: Path) -> dict[str, int]:
+    """Load previously scanned keywords for a repo.
+    Supports lines:
+      kw: <keyword> hits:<count>
+    Legacy:
+      keywords: k1 | k2 -> treated as hits=1
+    """
+    state: dict[str, int] = {}
+    if not fn.exists():
+        return state
+    try:
+        for line in fn.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("kw:"):
+                m = re.match(r'^kw:\s*(.*?)\s+hits:(-?\d+)$', line)
+                if m:
+                    k = m.group(1).strip()
+                    c = int(m.group(2))
+                    state[k] = c
+            elif line.startswith("keywords:"):
+                raw = line.split("keywords:", 1)[1].strip()
+                if raw and raw != "(none)":
+                    for k in raw.split("|"):
+                        kk = k.strip()
+                        if kk:
+                            state[kk] = 1
+    except Exception as e:
+        print(f"[kw-load] failed parsing {fn.name}: {e}", file=sys.stderr)
+    return state
+
+def write_repo_keyword_state(repo: str, state: dict[str, int], fn: Path):
+    """Rewrite the repo state file atomically."""
+    tmp = fn.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(f"repo: {repo}\n")
+            if not state:
+                f.write("keywords: (none)\n")
+            else:
+                for k in sorted(state.keys()):
+                    f.write(f"kw: {k} hits:{state[k]}\n")
+        tmp.replace(fn)
+    except Exception as e:
+        print(f"[kw-write] {repo} error writing file: {e}", file=sys.stderr)
+# --- end added helpers ---
 
 def search_repo(repo, query, tok, limiter:RateLimiter|None=None, retries:int=3, backoff_base:float=1.6):
     q=f"repo:{repo} {query} in:file"
@@ -261,32 +318,99 @@ def scan_keywords(a, tok, repo_set):
     keywords = load_keywords(Path(a.keywords_file))
     if not keywords:
         return
+
+    per_repo_dir = Path(a.per_repo_dir)
+    per_repo_dir.mkdir(parents=True, exist_ok=True)
+
     limiter_kw = RateLimiter(limit=max(1, a.rate), window=60)
-    repo_keyword_rows: list[tuple[str, list[str]]] = []
-    with ThreadPoolExecutor(max_workers=max(1, a.workers)) as ex:
-        futs = {
-            ex.submit(
-                detect_keywords_in_repo,
-                repo,
-                keywords,
-                tok,
-                limiter_kw,
-                (a.keywords_limit if a.keywords_limit > 0 else None),
-            ): repo
-            for repo in sorted(repo_set)
-        }
-        for i, f in enumerate(as_completed(futs), 1):
-            repo = futs[f]
-            try:
-                matched = f.result()
-                if matched:
-                    repo_keyword_rows.append((repo, matched))
-            except Exception as e:
-                print(f"[kw-scan] {repo} error: {e}", file=sys.stderr)
-            if i % 25 == 0 or i == len(futs):
-                print(f"[kw-progress] {i}/{len(futs)} repos processed", file=sys.stderr)
-    write_repo_keywords_csv(repo_keyword_rows, a.out_keywords)
+
+    to_scan = sorted(repo_set)
+    print(f"[keywords] scanning {len(to_scan)} repos (resume supported)", file=sys.stderr)
+
+    def process_repo(repo: str):
+        fn = per_repo_dir / safe_repo_filename(repo)
+        state = load_repo_keyword_state(fn)  # existing scanned keywords
+        already = set(state.keys())
+        pending = [k for k in keywords if k not in already]
+        if not pending:
+            # Nothing new; still ensure file exists in new format
+            write_repo_keyword_state(repo, state, fn)
+            return state
+        # Ensure file is created even if initial state empty
+        write_repo_keyword_state(repo, state, fn)
+        for kw in pending:
+            hits = repo_keyword_hits(repo, kw, tok, limiter_kw)
+            if hits >= 0:
+                state[kw] = hits
+                write_repo_keyword_state(repo, state, fn)  # incremental update
+            if a.keywords_limit > 0:
+                matched_positive = sum(1 for c in state.values() if c > 0)
+                if matched_positive >= a.keywords_limit:
+                    break
+        return state
+
+    if to_scan:
+        with ThreadPoolExecutor(max_workers=max(1, a.workers)) as ex:
+            futs = {ex.submit(process_repo, repo): repo for repo in to_scan}
+            for i, f in enumerate(as_completed(futs), 1):
+                repo = futs[f]
+                try:
+                    _ = f.result()
+                except Exception as e:
+                    print(f"[kw-scan] {repo} error: {e}", file=sys.stderr)
+                if i % 25 == 0 or i == len(futs):
+                    print(f"[kw-progress] {i}/{len(futs)} repos processed", file=sys.stderr)
+
+    # Aggregate all per-repo files (include only keywords with hits>0)
+    repo_keyword_rows: list[tuple[str, list[tuple[str, int]]]] = []
+    for f in per_repo_dir.glob("*.txt"):
+        try:
+            lines = f.read_text(encoding="utf-8").splitlines()
+            if not lines:
+                continue
+            repo_line = lines[0]
+            if not repo_line.startswith("repo:"):
+                continue
+            repo = repo_line.split("repo:", 1)[1].strip()
+            # Parse kw lines
+            pairs: list[tuple[str, int]] = []
+            for line in lines[1:]:
+                line = line.strip()
+                if line.startswith("kw:"):
+                    m = re.match(r'^kw:\s*(.*?)\s+hits:(-?\d+)$', line)
+                    if m:
+                        k = m.group(1).strip()
+                        c = int(m.group(2))
+                        if c > 0:
+                            pairs.append((k, c))
+                elif line.startswith("keywords:"):
+                    raw = line.split("keywords:", 1)[1].strip()
+                    if raw and raw != "(none)":
+                        for k in raw.split("|"):
+                            kk = k.strip()
+                            if kk:
+                                pairs.append((kk, 1))
+            if pairs:
+                repo_keyword_rows.append((repo, pairs))
+        except Exception as e:
+            print(f"[kw-aggregate] failed reading {f.name}: {e}", file=sys.stderr)
+
+    # Write CSV: keyword(count) joined by |
+    with open(a.out_keywords, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["repo", "keywords"])
+        for repo, pairs in repo_keyword_rows:
+            formatted = " | ".join(f"{k}({c})" for k, c in pairs)
+            w.writerow([repo, formatted])
     print(f"[keywords] {len(repo_keyword_rows)} repos with matches; written to {a.out_keywords}")
+
+def safe_repo_filename(repo: str) -> str:
+    """Convert full repo name org/name -> safe filename. Truncate & hash if too long."""
+    base = repo.replace("/", "__")
+    if len(base) > 120:
+        h = hashlib.sha256(repo.encode("utf-8")).hexdigest()[:16]
+        base = base[:80] + "__" + h
+    return base + ".txt"
 
 def parse_args():
     p=argparse.ArgumentParser()
@@ -296,8 +420,8 @@ def parse_args():
     p.add_argument("--out",default="results/repos_with_keyword.csv")
     p.add_argument("--max-pages",type=int,default=1000)
     p.add_argument("--max-repos", type=int, default=500, help="Scan at most this many repos in fallback mode (0=all)")
-    p.add_argument("--workers", type=int, default=4, help="Concurrent workers for fallback per-repo scans")
-    p.add_argument("--rate", type=int, default=4, help="Max code_search requests per minute (GitHub default ~10)")
+    p.add_argument("--workers", type=int, default=8, help="Concurrent workers for fallback per-repo scans")
+    p.add_argument("--rate", type=int, default=8, help="Max code_search requests per minute (GitHub default ~10)")
     p.add_argument("--sleep", type=float, default=0.0, help="Unused when workers>1 (kept for backward compat)")
     p.add_argument("--base-url", default=os.getenv("GITHUB_BASE_URL", "https://api.github.com"),
                    help="REST API base or web origin. Examples: https://api.github.com OR https://github.skyscannertools.net")
@@ -314,6 +438,8 @@ def parse_args():
                    help="Output CSV listing repo->matched keywords")
     p.add_argument("--keywords-limit", type=int, default=0,
                    help="If >0, stop after this many matches per repo to save requests")
+    p.add_argument("--per-repo-dir", default="results/repo",
+                   help="Directory to store per-repo keyword scan results for resume")
 
     print(f"base-url: {p.parse_args().base_url}", file=sys.stderr)
     return p.parse_args()
