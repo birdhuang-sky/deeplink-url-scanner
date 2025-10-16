@@ -1,6 +1,6 @@
 # src/org_scanner/github_search_deeplink_url.py
 #!/usr/bin/env python3
-import argparse, csv, os, sys, time, requests, threading, urllib.parse, hashlib, re, random
+import argparse, csv, json, os, sys, time, requests, threading, urllib.parse, hashlib, re, random
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -192,6 +192,10 @@ def build_code_search_url(query: str) -> str:
     """Return a GitHub web URL for a ready-to-use code search."""
     return f"https://github.com/search?q={urllib.parse.quote(query)}&type=code"
 
+def build_api_search_url(query: str) -> str:
+    """Return a GitHub REST API URL for executing the search query."""
+    return f"{_search_endpoint()}?q={urllib.parse.quote(query)}"
+
 # --- added stats & adaptive helpers ---
 token_stats = {
     "requests": [0, 0],   # per token index
@@ -244,16 +248,16 @@ def adaptive_sleep_for_403(r, idx, attempt):
     return 3 + random.uniform(0.2, 0.8), "generic-403"
 # --- end added helpers ---
 
-def repo_keyword_hits(repo: str, kw: str, tok: str | None, limiter: RateLimiter | None,
-                      extra_filters: str = "") -> int:
-    """Return total_count hits for keyword in repo (0 if none, -1 on hard error) with adaptive 403 handling."""
+def repo_keyword_search(repo: str, kw: str, tok: str | None, limiter: RateLimiter | None,
+                        extra_filters: str = "", include_payload: bool = False):
+    """Execute a repo keyword search, returning hits (and optionally the raw JSON payload)."""
     max_attempts = 6
     for attempt in range(1, max_attempts + 1):
         if limiter:
             limiter.acquire()
         tok_used, idx = get_token_idx()
         q = build_repo_keyword_query(repo, kw, extra_filters)
-        params = {"q": q, "per_page": 1, "page": 1}
+        params = {"q": q, "per_page": 100, "page": 1}
         try:
             r = requests.get(_search_endpoint(),
                              params=params,
@@ -277,6 +281,8 @@ def repo_keyword_hits(repo: str, kw: str, tok: str | None, limiter: RateLimiter 
             # fixed syntax error in f-string
             print(f"[kw-check] (token#{idx}) {repo} '{kw}' -> {hits} hits", file=sys.stderr)
             log_token_stats_if_needed()
+            if include_payload:
+                return hits, data
             return hits
 
         if r.status_code in (429, 500, 502, 503, 504):
@@ -302,14 +308,19 @@ def repo_keyword_hits(repo: str, kw: str, tok: str | None, limiter: RateLimiter 
 
             if attempt == max_attempts:
                 print(f"[kw-check] (token#{idx}) {repo} '{kw}' giving up after {max_attempts} attempts", file=sys.stderr)
-                return -1
+                return (-1, None) if include_payload else -1
             time.sleep(sleep_s)
             continue
 
         print(f"[kw-check] (token#{idx}) {repo} '{kw}' HTTP {r.status_code} abort", file=sys.stderr)
-        return -1
+        return (-1, None) if include_payload else -1
 
-    return -1  # fallback
+    return (-1, None) if include_payload else -1  # fallback
+
+def repo_keyword_hits(repo: str, kw: str, tok: str | None, limiter: RateLimiter | None,
+                      extra_filters: str = "") -> int:
+    """Backwards-compatible wrapper returning only hit counts."""
+    return repo_keyword_search(repo, kw, tok, limiter, extra_filters, include_payload=False)
 
 def detect_keywords_in_repo(repo: str, keywords: list[str], tok: str | None,
                             limiter: RateLimiter, max_keywords: int | None = None) -> list[str]:
@@ -375,23 +386,19 @@ def write_repo_keyword_state(repo: str, state: dict[str, int], fn: Path):
         print(f"[kw-write] {repo} error writing file: {e}", file=sys.stderr)
 # --- end added helpers ---
 
-def write_repo_no_test_results(repo: str, rows: list[tuple[str, str, str, int]], directory: Path):
-    """Persist per-repo results for the '-path:test' follow-up scan."""
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / safe_repo_filename(repo)
-    target = target.with_suffix(".csv")
+def write_keyword_payload(repo_dir: Path, keyword: str, payload: dict | list | None):
+    """Persist the full search payload for a single repo/keyword combination."""
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    target = repo_dir / safe_keyword_filename(keyword)
     try:
-        with open(target, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["keyword", "hits", "query", "search_url"])
-            for keyword, query, url, hits in rows:
-                writer.writerow([keyword, hits, query, url])
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump(payload if payload is not None else {"error": "no_payload"}, f, indent=2)
     except Exception as e:
-        print(f"[kw-write-no-test] {repo} error writing file: {e}", file=sys.stderr)
+        print(f"[kw-write-json] {repo_dir.name}:{keyword} error writing file: {e}", file=sys.stderr)
 
 def search_repo(repo, query, tok, limiter:RateLimiter|None=None, retries:int=3, backoff_base:float=1.6):
     q=f"repo:{repo} {query} in:file"
-    params={"q":q,"per_page":5,"page":1}
+    params={"q":q,"per_page":100,"page":1}
     for attempt in range(retries+1):
         if limiter:
             limiter.acquire()
@@ -602,27 +609,27 @@ def scan_keywords_without_test(a, tok):
     limiter_kw = RateLimiter(limit=max(1, effective_rate), window=60)
 
     per_repo_dir = Path(a.per_repo_no_test_dir)
-    aggregated_rows: list[tuple[str, str, int, str, str]] = []
+    aggregated_rows: list[tuple[str, str, int, str, str, str]] = []
 
     for repo in sorted(selections.keys()):
         keywords = sorted(selections[repo])
-        repo_rows: list[tuple[str, str, str, int]] = []
+        repo_dir = per_repo_dir / safe_repo_slug(repo)
         for keyword in keywords:
             extra_filter = "-path:test"
-            hits = repo_keyword_hits(repo, keyword, tok, limiter_kw, extra_filter)
+            hits, payload = repo_keyword_search(repo, keyword, tok, limiter_kw, extra_filter, include_payload=True)
             query = build_repo_keyword_query(repo, keyword, extra_filter)
             url = build_code_search_url(query)
-            repo_rows.append((keyword, query, url, hits))
-            aggregated_rows.append((repo, keyword, hits, query, url))
-        write_repo_no_test_results(repo, repo_rows, per_repo_dir)
+            api_url = build_api_search_url(query)
+            write_keyword_payload(repo_dir, keyword, payload)
+            aggregated_rows.append((repo, keyword, hits, query, url, api_url))
 
     out_csv = Path(a.out_keywords_no_test)
     try:
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["repo", "keyword", "hits", "query", "search_url"])
-            for repo, keyword, hits, query, url in aggregated_rows:
-                writer.writerow([repo, keyword, hits, query, url])
+            writer.writerow(["repo", "keyword", "hits", "query", "search_url", "api_url"])
+            for repo, keyword, hits, query, url, api_url in aggregated_rows:
+                writer.writerow([repo, keyword, hits, query, url, api_url])
         print(f"[keywords-no-test] {len(aggregated_rows)} rows written to {out_csv}")
     except Exception as e:
         print(f"[keywords-no-test] failed writing {out_csv}: {e}", file=sys.stderr)
@@ -632,12 +639,27 @@ def build_single_keyword_search_url(repo: str, keyword: str) -> str:
     q = build_repo_keyword_query(repo, keyword)
     return build_code_search_url(q)
 
-def safe_repo_filename(repo: str) -> str:
-    """Convert full repo name org/name -> safe filename. Truncate & hash if too long."""
+def safe_repo_slug(repo: str) -> str:
+    """Convert full repo name org/name -> safe slug usable for filenames/dirs."""
     base = repo.replace("/", "__")
     if len(base) > 120:
         h = hashlib.sha256(repo.encode("utf-8")).hexdigest()[:16]
         base = base[:80] + "__" + h
+    return base
+
+def safe_repo_filename(repo: str) -> str:
+    """Safe filename (txt) for repo keyword state persistence."""
+    return safe_repo_slug(repo) + ".txt"
+
+def safe_keyword_filename(keyword: str) -> str:
+    """Return a safe filename for keyword-specific JSON payloads."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", keyword).strip("_")
+    if not slug:
+        slug = "keyword"
+    if len(slug) > 80:
+        digest = hashlib.sha256(keyword.encode("utf-8")).hexdigest()[:16]
+        slug = slug[:60] + "__" + digest
+    return slug + ".json"
     return base + ".txt"
 
 def parse_args():
@@ -651,7 +673,7 @@ def parse_args():
     p.add_argument("--max-pages",type=int,default=1000)
     p.add_argument("--max-repos", type=int, default=500, help="Scan at most this many repos in fallback mode (0=all)")
     p.add_argument("--workers", type=int, default=8, help="Concurrent workers for fallback per-repo scans")
-    p.add_argument("--rate", type=int, default=10, help="Max code_search requests per minute (GitHub default ~10)")
+    p.add_argument("--rate", type=int, default=9, help="Max code_search requests per minute (GitHub default ~10)")
     p.add_argument("--sleep", type=float, default=0.0, help="Unused when workers>1 (kept for backward compat)")
     p.add_argument("--base-url", default=os.getenv("GITHUB_BASE_URL", "https://api.github.com"),
                    help="REST API base or web origin. Examples: https://api.github.com OR https://github.skyscannertools.net")
