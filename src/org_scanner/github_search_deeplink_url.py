@@ -1,6 +1,6 @@
 # src/org_scanner/github_search_deeplink_url.py
 #!/usr/bin/env python3
-import argparse, csv, os, sys, time, requests, threading, urllib.parse, hashlib, re
+import argparse, csv, os, sys, time, requests, threading, urllib.parse, hashlib, re, random
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -9,8 +9,8 @@ from pathlib import Path
 from org_scanner.repo_filter import ExcludeRepoFilter
 
 
-API_BASE = "https://api.github.com"   # may be changed at runtime via --base-url
-VERIFY: bool | str = True              # requests verify flag (bool or CA path)
+API_BASE = "https://api.github.com"
+VERIFY: bool | str = True
 EXCLUDE_FILE_TYPE_LIST = ['PROTO']
 
 @dataclass
@@ -20,25 +20,56 @@ class Hit:
     url: str
 
 class RateLimiter:
-    """Sliding-window limiter: allow at most `limit` requests per `window` seconds.
-    Thread-safe and suitable for moderate concurrency (do not exceed ~32 workers).
-    """
-    def __init__(self, limit:int=10, window:int=60):
-        self.limit = max(1, limit)
+    """Simple sliding-window request limiter."""
+    def __init__(self, limit: int, window: float):
+        self.limit = limit
         self.window = window
         self.lock = threading.Lock()
-        self.ts = deque()
+        self.times = deque()
+
     def acquire(self):
-        while True:
-            with self.lock:
+        with self.lock:
+            now = time.time()
+            while self.times and now - self.times[0] > self.window:
+                self.times.popleft()
+            if len(self.times) >= self.limit:
+                sleep_for = self.window - (now - self.times[0]) + 0.001
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                # After sleep, cleanup again
                 now = time.time()
-                while self.ts and now - self.ts[0] >= self.window:
-                    self.ts.popleft()
-                if len(self.ts) < self.limit:
-                    self.ts.append(now)
-                    return
-                sleep_for = self.window - (now - self.ts[0]) + 0.01
-            time.sleep(max(0.05, sleep_for))
+                while self.times and now - self.times[0] > self.window:
+                    self.times.popleft()
+            self.times.append(time.time())
+
+# --- added for multi-token rotation ---
+TOKEN_LIST: list[str] = []
+_TOKEN_IDX = 0
+_TOKEN_LOCK = threading.Lock()
+
+def get_token() -> str | None:
+    """Round-robin select a token for this request."""
+    global _TOKEN_IDX
+    if not TOKEN_LIST:
+        return None
+    with _TOKEN_LOCK:
+        tok = TOKEN_LIST[_TOKEN_IDX]
+        _TOKEN_IDX = (_TOKEN_IDX + 1) % len(TOKEN_LIST)
+        return tok
+# --- end added ---
+
+# --- added: token+index helper for logging ---
+def get_token_idx() -> tuple[str | None, int]:
+    """Return (token, index_used) and advance round-robin."""
+    global _TOKEN_IDX
+    if not TOKEN_LIST:
+        return None, -1
+    with _TOKEN_LOCK:
+        idx = _TOKEN_IDX
+        tok = TOKEN_LIST[idx]
+        _TOKEN_IDX = (_TOKEN_IDX + 1) % len(TOKEN_LIST)
+        return tok, idx
+# --- end added ---
 
 def headers(tok:str|None):
     h={"Accept":"application/vnd.github.v3+json",
@@ -71,8 +102,10 @@ def search_org(org, query, tok, max_pages=10):
     q=f"org:{org} {query} in:file"
     print(f"q = {q}", file=sys.stderr)
     for page in range(1,max_pages+1):
-        r=session.get(_search_endpoint(), params={"q":q,"per_page":100,"page":page},
-                      headers=headers(tok), timeout=30, verify=VERIFY)
+        r=session.get(_search_endpoint(),
+                      params={"q":q,"per_page":100,"page":page},
+                      headers=headers(get_token()),  # changed: rotate token
+                      timeout=30, verify=VERIFY)
         if r.status_code!=200:
             print(f"[org-search] HTTP {r.status_code} {r.text[:150]}",file=sys.stderr)
             break
@@ -91,8 +124,10 @@ def search_org(org, query, tok, max_pages=10):
 def list_repos(org,tok):
     out=[]; page=1
     while True:
-        r=requests.get(_org_repos_endpoint(org), headers=headers(tok),
-                       params={"per_page":100,"page":page,"type":"all"}, timeout=30, verify=VERIFY)
+        r=requests.get(_org_repos_endpoint(org),
+                       headers=headers(get_token()),  # changed
+                       params={"per_page":100,"page":page,"type":"all"},
+                       timeout=30, verify=VERIFY)
         if r.status_code!=200: break
         chunk=r.json()
         if not chunk: break
@@ -145,27 +180,123 @@ def keyword_query_fragment(kw: str) -> str:
         return f'"{kw}"'
     return kw
 
-def repo_keyword_hits(repo: str, kw: str, tok: str | None, limiter: RateLimiter | None) -> int:
-    """Return total_count hits for keyword in repo (0 if none, -1 on hard error)."""
-    q = f"repo:{repo} {keyword_query_fragment(kw)} in:file"
-    params = {"q": q, "per_page": 1, "page": 1}
-    if limiter:
-        limiter.acquire()
+# --- added stats & adaptive helpers ---
+token_stats = {
+    "requests": [0, 0],   # per token index
+    "403": [0, 0],
+    "last_log": time.time(),
+    "window_extended": False
+}
+
+def log_token_stats_if_needed():
+    if not TOKEN_LIST:
+        return
+    total_requests = sum(token_stats["requests"])
+    if total_requests % 200 == 0 and total_requests > 0:
+        r0 = token_stats["requests"][0] if len(token_stats["requests"]) > 0 else 0
+        r1 = token_stats["requests"][1] if len(token_stats["requests"]) > 1 else 0
+        f0 = token_stats["403"][0] if len(token_stats["403"]) > 0 else 0
+        f1 = token_stats["403"][1] if len(token_stats["403"]) > 1 else 0
+        print(f"[tokens-stats] reqs={total_requests} token0(req={r0},403={f0}) token1(req={r1},403={f1})",
+              file=sys.stderr)
+
+def adaptive_sleep_for_403(r, idx, attempt):
+    # Returns (sleep_seconds, reason)
+    remaining = r.headers.get("X-RateLimit-Remaining")
+    reset = r.headers.get("X-RateLimit-Reset")
+    retry_after = r.headers.get("Retry-After")
+    msg = ""
     try:
-        r = requests.get(_search_endpoint(), params=params, headers=headers(tok), timeout=30, verify=VERIFY)
-    except requests.RequestException as e:
-        print(f"[kw-check] {repo} '{kw}' network error: {e}", file=sys.stderr)
+        j = r.json()
+        msg = (j.get("message") or "").lower()
+    except Exception:
+        pass
+    if remaining == "0" and reset:
+        try:
+            reset_ts = int(reset)
+            wait = max(0, reset_ts - int(time.time()) + 2)
+            return wait, "primary-rate-limit"
+        except ValueError:
+            pass
+    if retry_after:
+        try:
+            wait = int(retry_after) + 1
+            return wait, "retry-after"
+        except ValueError:
+            pass
+    if "abuse" in msg or "abuse detection" in msg:
+        # Exponential backoff with jitter
+        wait = min(60, (2 ** attempt)) + random.uniform(0.5, 1.5)
+        return wait, "abuse-detection"
+    # Generic fallback
+    return 3 + random.uniform(0.2, 0.8), "generic-403"
+# --- end added helpers ---
+
+def repo_keyword_hits(repo: str, kw: str, tok: str | None, limiter: RateLimiter | None) -> int:
+    """Return total_count hits for keyword in repo (0 if none, -1 on hard error) with adaptive 403 handling."""
+    max_attempts = 6
+    for attempt in range(1, max_attempts + 1):
+        if limiter:
+            limiter.acquire()
+        tok_used, idx = get_token_idx()
+        q = f"repo:{repo} {keyword_query_fragment(kw)} in:file"
+        params = {"q": q, "per_page": 1, "page": 1}
+        try:
+            r = requests.get(_search_endpoint(),
+                             params=params,
+                             headers=headers(tok_used),
+                             timeout=30, verify=VERIFY)
+        except requests.RequestException as e:
+            print(f"[kw-check] (token#{idx}) {repo} '{kw}' network error attempt={attempt}/{max_attempts}: {e}",
+                  file=sys.stderr)
+            time.sleep(min(2 * attempt, 20))
+            continue
+
+        # Stats
+        while len(token_stats["requests"]) < len(TOKEN_LIST):
+            token_stats["requests"].append(0)
+            token_stats["403"].append(0)
+        token_stats["requests"][idx] += 1
+
+        if r.status_code == 200:
+            data = r.json()
+            hits = int(data.get("total_count", 0) or 0)
+            # fixed syntax error in f-string
+            print(f"[kw-check] (token#{idx}) {repo} '{kw}' -> {hits} hits", file=sys.stderr)
+            log_token_stats_if_needed()
+            return hits
+
+        if r.status_code in (429, 500, 502, 503, 504):
+            print(f"[kw-check] (token#{idx}) {repo} '{kw}' transient {r.status_code} attempt={attempt}/{max_attempts}",
+                  file=sys.stderr)
+            time.sleep(min(2 ** attempt, 30) + random.uniform(0.2, 0.8))
+            continue
+
+        if r.status_code == 403:
+            token_stats["403"][idx] += 1
+            sleep_s, reason = adaptive_sleep_for_403(r, idx, attempt)
+            print(f"[kw-check] (token#{idx}) {repo} '{kw}' HTTP 403 reason={reason} sleep={sleep_s:.1f}s "
+                  f"attempt={attempt}/{max_attempts}", file=sys.stderr)
+
+            # If too many 403 overall, widen limiter window once (slow down globally)
+            total_403 = sum(token_stats["403"])
+            total_req = sum(token_stats["requests"])
+            if total_req > 50 and total_403 / total_req > 0.3 and not token_stats["window_extended"] and limiter:
+                limiter.window *= 1.3
+                token_stats["window_extended"] = True
+                print(f"[adaptive] Increased limiter window to {limiter.window:.1f}s due to 403 ratio",
+                      file=sys.stderr)
+
+            if attempt == max_attempts:
+                print(f"[kw-check] (token#{idx}) {repo} '{kw}' giving up after {max_attempts} attempts", file=sys.stderr)
+                return -1
+            time.sleep(sleep_s)
+            continue
+
+        print(f"[kw-check] (token#{idx}) {repo} '{kw}' HTTP {r.status_code} abort", file=sys.stderr)
         return -1
-    if r.status_code == 200:
-        data = r.json()
-        hits = int(data.get("total_count", 0) or 0)
-        print(f"[kw-check] {repo} '{kw}' -> {hits} hits", file=sys.stderr)
-        return hits
-    if r.status_code in (429, 500, 502, 503, 504):
-        time.sleep(1.2)
-        return repo_keyword_hits(repo, kw, tok, limiter)
-    print(f"[kw-check] {repo} '{kw}' HTTP {r.status_code}", file=sys.stderr)
-    return -1
+
+    return -1  # fallback
 
 def detect_keywords_in_repo(repo: str, keywords: list[str], tok: str | None,
                             limiter: RateLimiter, max_keywords: int | None = None) -> list[str]:
@@ -238,7 +369,10 @@ def search_repo(repo, query, tok, limiter:RateLimiter|None=None, retries:int=3, 
         if limiter:
             limiter.acquire()
         try:
-            r=requests.get(_search_endpoint(), params=params, headers=headers(tok), timeout=30, verify=VERIFY)
+            r=requests.get(_search_endpoint(),
+                           params=params,
+                           headers=headers(get_token()),  # changed
+                           timeout=30, verify=VERIFY)
         except requests.RequestException as e:
             if attempt<retries:
                 time.sleep((backoff_base**attempt)+0.2); continue
@@ -295,7 +429,9 @@ def fallback_after_search_org_fail(a, exclude_filter, tok):
     if a.max_repos and len(repos) > a.max_repos:
         repos = repos[:a.max_repos]
         print(f"[limit] truncated to first {len(repos)} repos due to --max-repos", file=sys.stderr)
-    limiter = RateLimiter(limit=max(1, a.rate), window=60)
+    # replaced limiter creation (remove unconditional multiplication; use effective_rate)
+    effective_rate = a.rate if a.rate_mode == "total" else a.rate * max(1, len(TOKEN_LIST))
+    limiter = RateLimiter(limit=max(1, effective_rate), window=60)  # changed
     results = []
     with ThreadPoolExecutor(max_workers=max(1, a.workers)) as ex:
         futs = {ex.submit(search_repo, r, a.query, tok, limiter): r for r in repos}
@@ -322,7 +458,9 @@ def scan_keywords(a, tok, repo_set):
     per_repo_dir = Path(a.per_repo_dir)
     per_repo_dir.mkdir(parents=True, exist_ok=True)
 
-    limiter_kw = RateLimiter(limit=max(1, a.rate), window=60)
+    # changed: use effective_rate based on mode
+    effective_rate = a.rate if a.rate_mode == "total" else a.rate * max(1, len(TOKEN_LIST))
+    limiter_kw = RateLimiter(limit=max(1, effective_rate), window=60)  # changed
 
     to_scan = sorted(repo_set)
     print(f"[keywords] scanning {len(to_scan)} repos (resume supported)", file=sys.stderr)
@@ -395,14 +533,21 @@ def scan_keywords(a, tok, repo_set):
         except Exception as e:
             print(f"[kw-aggregate] failed reading {f.name}: {e}", file=sys.stderr)
 
-    # Write CSV: keyword(count) joined by |
+    # Write CSV: one row per (repo, keyword)
     with open(a.out_keywords, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["repo", "keywords"])
+        w.writerow(["repo", "keyword", "hits", "search_url"])
         for repo, pairs in repo_keyword_rows:
-            formatted = " | ".join(f"{k}({c})" for k, c in pairs)
-            w.writerow([repo, formatted])
-    print(f"[keywords] {len(repo_keyword_rows)} repos with matches; written to {a.out_keywords}")
+            for k, c in pairs:
+                search_url = build_single_keyword_search_url(repo, k)
+                w.writerow([repo, k, c, search_url])
+    print(f"[keywords] {sum(len(pairs) for _, pairs in repo_keyword_rows)} repo-keyword rows written to {a.out_keywords}")
+
+def build_single_keyword_search_url(repo: str, keyword: str) -> str:
+    """GitHub code search URL for a single keyword within a repo."""
+    frag = keyword_query_fragment(keyword)
+    q = f"repo:{repo} {frag}"
+    return f"https://github.com/search?q={urllib.parse.quote(q)}&type=code"
 
 def safe_repo_filename(repo: str) -> str:
     """Convert full repo name org/name -> safe filename. Truncate & hash if too long."""
@@ -417,11 +562,13 @@ def parse_args():
     p.add_argument("--org",default="skyscanner")
     p.add_argument("--query",default='"deeplink_url"')
     p.add_argument("--token",default=os.getenv("GITHUB_TOKEN"))
+    p.add_argument("--token2", default=os.getenv("GITHUB_TOKEN2"),
+                   help="Optional second GitHub token to increase parallel search throughput")
     p.add_argument("--out",default="results/repos_with_keyword.csv")
     p.add_argument("--max-pages",type=int,default=1000)
     p.add_argument("--max-repos", type=int, default=500, help="Scan at most this many repos in fallback mode (0=all)")
     p.add_argument("--workers", type=int, default=8, help="Concurrent workers for fallback per-repo scans")
-    p.add_argument("--rate", type=int, default=8, help="Max code_search requests per minute (GitHub default ~10)")
+    p.add_argument("--rate", type=int, default=7, help="Max code_search requests per minute (GitHub default ~10)")
     p.add_argument("--sleep", type=float, default=0.0, help="Unused when workers>1 (kept for backward compat)")
     p.add_argument("--base-url", default=os.getenv("GITHUB_BASE_URL", "https://api.github.com"),
                    help="REST API base or web origin. Examples: https://api.github.com OR https://github.skyscannertools.net")
@@ -440,12 +587,14 @@ def parse_args():
                    help="If >0, stop after this many matches per repo to save requests")
     p.add_argument("--per-repo-dir", default="results/repo",
                    help="Directory to store per-repo keyword scan results for resume")
+    p.add_argument("--rate-mode", choices=["total","per-token"], default="total",
+                   help="Interpret --rate as total allowed per minute (total) or per token (per-token)")
 
     print(f"base-url: {p.parse_args().base_url}", file=sys.stderr)
     return p.parse_args()
 
 def main():
-    global API_BASE, VERIFY
+    global API_BASE, VERIFY, TOKEN_LIST
     args = parse_args()
 
     # TLS settings
@@ -459,8 +608,17 @@ def main():
     API_BASE = normalize_api_base(args.base_url)
 
     tok = args.token
-    if not tok:
-        print("Missing GITHUB_TOKEN", file=sys.stderr)
+    tok2 = args.token2
+    TOKEN_LIST = [t for t in [tok, tok2] if t]
+    if not TOKEN_LIST:
+        print("Missing GITHUB_TOKEN (and optional --token2)", file=sys.stderr)
+    elif len(TOKEN_LIST) > 1:
+        print(f"[tokens] using {len(TOKEN_LIST)} tokens (round-robin)", file=sys.stderr)
+
+    if len(TOKEN_LIST) > 1 and hasattr(sys, "stderr"):
+        mode = "global-total" if getattr(args, "rate_mode", "total") == "total" else "per-token"
+        print(f"[tokens] mode={mode} configured-rate={args.rate} effective-rate-per-minute="
+              f"{(args.rate if mode=='global-total' else args.rate*len(TOKEN_LIST))}", file=sys.stderr)
 
     # Load exclude filter once
     exclude_filter = ExcludeRepoFilter(Path(args.exclude_file))
