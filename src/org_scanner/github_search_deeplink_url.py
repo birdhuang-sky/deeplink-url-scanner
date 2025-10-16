@@ -407,9 +407,12 @@ def filter_payload_items(payload: dict | list | None) -> list[dict]:
         return []
     items = payload.get("items") or []
     filtered: list[dict] = []
+    excluded_suffixes = (".xml", ".md", ".proto", ".json")
     for item in items:
         path = (item.get("path") or "")
         if "test" in path.lower():
+            continue
+        if path.lower().endswith(excluded_suffixes):
             continue
         filtered.append(item)
     return filtered
