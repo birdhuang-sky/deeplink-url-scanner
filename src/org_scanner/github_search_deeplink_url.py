@@ -615,7 +615,7 @@ def scan_keywords_without_test(a, tok):
         keywords = sorted(selections[repo])
         repo_dir = per_repo_dir / safe_repo_slug(repo)
         for keyword in keywords:
-            extra_filter = "-path:test"
+            extra_filter = "" #"-path:test"
             keyword_file = repo_dir / safe_keyword_filename(keyword)
 
             payload: dict | list | None = None
