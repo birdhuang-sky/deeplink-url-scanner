@@ -648,7 +648,7 @@ def scan_keywords_without_test(a, tok):
     limiter_kw = RateLimiter(limit=max(1, effective_rate), window=60)
 
     per_repo_dir = Path(a.per_repo_no_test_dir)
-    aggregated_rows: list[tuple[str, str, int, str, str, str]] = []
+    repo_keyword_map: dict[str, list[tuple[str, int, str, str, str]]] = defaultdict(list)
 
     for repo in sorted(selections.keys()):
         keywords = sorted(selections[repo])
@@ -686,7 +686,7 @@ def scan_keywords_without_test(a, tok):
                     url = build_code_search_url(query)
                     api_url = build_api_search_url(query)
                     if hits > 0:
-                        aggregated_rows.append((repo, keyword, hits, query, url, api_url))
+                        repo_keyword_map[repo].append((keyword, hits, query, url, api_url))
                     continue
 
             filtered_items = []
@@ -716,16 +716,22 @@ def scan_keywords_without_test(a, tok):
             url = build_code_search_url(query)
             api_url = build_api_search_url(query)
             if hits > 0:
-                aggregated_rows.append((repo, keyword, hits, query, url, api_url))
+                repo_keyword_map[repo].append((keyword, hits, query, url, api_url))
 
     out_csv = Path(a.out_keywords_no_test)
     try:
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["repo", "keyword", "hits", "query", "search_url", "api_url"])
-            for repo, keyword, hits, query, url, api_url in aggregated_rows:
-                writer.writerow([repo, keyword, hits, query, url, api_url])
-        print(f"[keywords-no-test] {len(aggregated_rows)} rows written to {out_csv}")
+            writer.writerow(["repo", "keywords", "total_hits", "queries", "search_urls", "api_urls"])
+            for repo, entries in sorted(repo_keyword_map.items()):
+                keywords_str = " | ".join(e[0] for e in entries)
+                total_hits = sum(e[1] for e in entries)
+                queries_str = " | ".join(e[2] for e in entries)
+                search_urls_str = " | ".join(e[3] for e in entries)
+                api_urls_str = " | ".join(e[4] for e in entries)
+                writer.writerow([repo, keywords_str, total_hits, queries_str, search_urls_str, api_urls_str])
+        rows_written = sum(len(entries) > 0 for entries in repo_keyword_map.values())
+        print(f"[keywords-no-test] {rows_written} repo rows written to {out_csv}")
     except Exception as e:
         print(f"[keywords-no-test] failed writing {out_csv}: {e}", file=sys.stderr)
 
