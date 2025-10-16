@@ -180,6 +180,18 @@ def keyword_query_fragment(kw: str) -> str:
         return f'"{kw}"'
     return kw
 
+def build_repo_keyword_query(repo: str, keyword: str, extra_filters: str = "") -> str:
+    """Compose the GitHub code search query for a repo/keyword combination."""
+    parts = [f"repo:{repo}", keyword_query_fragment(keyword), 'in:file']
+    extra = extra_filters.strip()
+    if extra:
+        parts.append(extra)
+    return " ".join(parts)
+
+def build_code_search_url(query: str) -> str:
+    """Return a GitHub web URL for a ready-to-use code search."""
+    return f"https://github.com/search?q={urllib.parse.quote(query)}&type=code"
+
 # --- added stats & adaptive helpers ---
 token_stats = {
     "requests": [0, 0],   # per token index
@@ -232,14 +244,15 @@ def adaptive_sleep_for_403(r, idx, attempt):
     return 3 + random.uniform(0.2, 0.8), "generic-403"
 # --- end added helpers ---
 
-def repo_keyword_hits(repo: str, kw: str, tok: str | None, limiter: RateLimiter | None) -> int:
+def repo_keyword_hits(repo: str, kw: str, tok: str | None, limiter: RateLimiter | None,
+                      extra_filters: str = "") -> int:
     """Return total_count hits for keyword in repo (0 if none, -1 on hard error) with adaptive 403 handling."""
     max_attempts = 6
     for attempt in range(1, max_attempts + 1):
         if limiter:
             limiter.acquire()
         tok_used, idx = get_token_idx()
-        q = f"repo:{repo} {keyword_query_fragment(kw)} in:file"
+        q = build_repo_keyword_query(repo, kw, extra_filters)
         params = {"q": q, "per_page": 1, "page": 1}
         try:
             r = requests.get(_search_endpoint(),
@@ -361,6 +374,20 @@ def write_repo_keyword_state(repo: str, state: dict[str, int], fn: Path):
     except Exception as e:
         print(f"[kw-write] {repo} error writing file: {e}", file=sys.stderr)
 # --- end added helpers ---
+
+def write_repo_no_test_results(repo: str, rows: list[tuple[str, str, str, int]], directory: Path):
+    """Persist per-repo results for the '-path:test' follow-up scan."""
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / safe_repo_filename(repo)
+    target = target.with_suffix(".csv")
+    try:
+        with open(target, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["keyword", "hits", "query", "search_url"])
+            for keyword, query, url, hits in rows:
+                writer.writerow([keyword, hits, query, url])
+    except Exception as e:
+        print(f"[kw-write-no-test] {repo} error writing file: {e}", file=sys.stderr)
 
 def search_repo(repo, query, tok, limiter:RateLimiter|None=None, retries:int=3, backoff_base:float=1.6):
     q=f"repo:{repo} {query} in:file"
@@ -543,11 +570,67 @@ def scan_keywords(a, tok, repo_set):
                 w.writerow([repo, k, c, search_url])
     print(f"[keywords] {sum(len(pairs) for _, pairs in repo_keyword_rows)} repo-keyword rows written to {a.out_keywords}")
 
+def scan_keywords_without_test(a, tok):
+    """Re-scan previously matched keywords while excluding paths that contain 'test'."""
+    source_csv = Path(a.out_keywords)
+    if not source_csv.exists():
+        print(f"[keywords-no-test] source file missing: {source_csv}", file=sys.stderr)
+        return
+
+    selections: dict[str, set[str]] = defaultdict(set)
+    with open(source_csv, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            repo = (row.get("repo") or "").strip()
+            keyword = (row.get("keyword") or "").strip()
+            hits_raw = (row.get("hits") or "0").strip()
+            if not repo or not keyword:
+                continue
+            try:
+                hits_val = int(float(hits_raw))
+            except ValueError:
+                continue
+            if hits_val <= 0:
+                continue
+            selections[repo].add(keyword)
+
+    if not selections:
+        print("[keywords-no-test] no positive-hit keywords found in source CSV", file=sys.stderr)
+        return
+
+    effective_rate = a.rate if a.rate_mode == "total" else a.rate * max(1, len(TOKEN_LIST))
+    limiter_kw = RateLimiter(limit=max(1, effective_rate), window=60)
+
+    per_repo_dir = Path(a.per_repo_no_test_dir)
+    aggregated_rows: list[tuple[str, str, int, str, str]] = []
+
+    for repo in sorted(selections.keys()):
+        keywords = sorted(selections[repo])
+        repo_rows: list[tuple[str, str, str, int]] = []
+        for keyword in keywords:
+            extra_filter = "-path:test"
+            hits = repo_keyword_hits(repo, keyword, tok, limiter_kw, extra_filter)
+            query = build_repo_keyword_query(repo, keyword, extra_filter)
+            url = build_code_search_url(query)
+            repo_rows.append((keyword, query, url, hits))
+            aggregated_rows.append((repo, keyword, hits, query, url))
+        write_repo_no_test_results(repo, repo_rows, per_repo_dir)
+
+    out_csv = Path(a.out_keywords_no_test)
+    try:
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["repo", "keyword", "hits", "query", "search_url"])
+            for repo, keyword, hits, query, url in aggregated_rows:
+                writer.writerow([repo, keyword, hits, query, url])
+        print(f"[keywords-no-test] {len(aggregated_rows)} rows written to {out_csv}")
+    except Exception as e:
+        print(f"[keywords-no-test] failed writing {out_csv}: {e}", file=sys.stderr)
+
 def build_single_keyword_search_url(repo: str, keyword: str) -> str:
     """GitHub code search URL for a single keyword within a repo."""
-    frag = keyword_query_fragment(keyword)
-    q = f"repo:{repo} {frag}"
-    return f"https://github.com/search?q={urllib.parse.quote(q)}&type=code"
+    q = build_repo_keyword_query(repo, keyword)
+    return build_code_search_url(q)
 
 def safe_repo_filename(repo: str) -> str:
     """Convert full repo name org/name -> safe filename. Truncate & hash if too long."""
@@ -568,7 +651,7 @@ def parse_args():
     p.add_argument("--max-pages",type=int,default=1000)
     p.add_argument("--max-repos", type=int, default=500, help="Scan at most this many repos in fallback mode (0=all)")
     p.add_argument("--workers", type=int, default=8, help="Concurrent workers for fallback per-repo scans")
-    p.add_argument("--rate", type=int, default=7, help="Max code_search requests per minute (GitHub default ~10)")
+    p.add_argument("--rate", type=int, default=10, help="Max code_search requests per minute (GitHub default ~10)")
     p.add_argument("--sleep", type=float, default=0.0, help="Unused when workers>1 (kept for backward compat)")
     p.add_argument("--base-url", default=os.getenv("GITHUB_BASE_URL", "https://api.github.com"),
                    help="REST API base or web origin. Examples: https://api.github.com OR https://github.skyscannertools.net")
@@ -587,6 +670,10 @@ def parse_args():
                    help="If >0, stop after this many matches per repo to save requests")
     p.add_argument("--per-repo-dir", default="results/repo",
                    help="Directory to store per-repo keyword scan results for resume")
+    p.add_argument("--per-repo-no-test-dir", default="results/repo-without-test",
+                   help="Directory for per-repo keyword results excluding test paths")
+    p.add_argument("--out-keywords-no-test", default="results/repo_keywords_no_test.csv",
+                   help="Output CSV for keywords re-scanned with '-path:test' filter applied")
     p.add_argument("--rate-mode", choices=["total","per-token"], default="total",
                    help="Interpret --rate as total allowed per minute (total) or per token (per-token)")
 
@@ -657,7 +744,8 @@ def main():
     else:
         print(f"[preload] skipping writing {args.out} (no fresh search performed)", file=sys.stderr)
 
-    scan_keywords(args, tok, repo_set)
+    # scan_keywords(args, tok, repo_set)
+    scan_keywords_without_test(args, tok)
 
 if __name__=="__main__":
     main()
