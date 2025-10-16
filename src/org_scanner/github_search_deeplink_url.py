@@ -396,6 +396,42 @@ def write_keyword_payload(repo_dir: Path, keyword: str, payload: dict | list | N
     except Exception as e:
         print(f"[kw-write-json] {repo_dir.name}:{keyword} error writing file: {e}", file=sys.stderr)
 
+def keyword_csv_filename(keyword: str) -> str:
+    base = safe_keyword_filename(keyword)
+    if base.endswith(".json"):
+        base = base[:-5]
+    return base + ".csv"
+
+def filter_payload_items(payload: dict | list | None) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    items = payload.get("items") or []
+    filtered: list[dict] = []
+    for item in items:
+        path = (item.get("path") or "")
+        if "test" in path.lower():
+            continue
+        filtered.append(item)
+    return filtered
+
+def write_keyword_items_csv(repo_dir: Path, keyword: str, items: list[dict]):
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    target = repo_dir / keyword_csv_filename(keyword)
+    try:
+        with open(target, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["name", "path", "url", "git_url", "html_url"])
+            for item in items:
+                writer.writerow([
+                    item.get("name", ""),
+                    item.get("path", ""),
+                    item.get("url", ""),
+                    item.get("git_url", ""),
+                    item.get("html_url", ""),
+                ])
+    except Exception as e:
+        print(f"[kw-write-csv] {repo_dir.name}:{keyword} error writing file: {e}", file=sys.stderr)
+
 def search_repo(repo, query, tok, limiter:RateLimiter|None=None, retries:int=3, backoff_base:float=1.6):
     q=f"repo:{repo} {query} in:file"
     params={"q":q,"per_page":100,"page":1}
@@ -615,35 +651,69 @@ def scan_keywords_without_test(a, tok):
         keywords = sorted(selections[repo])
         repo_dir = per_repo_dir / safe_repo_slug(repo)
         for keyword in keywords:
-            extra_filter = "" #"-path:test"
-            keyword_file = repo_dir / safe_keyword_filename(keyword)
+            extra_filter = "-path:test"
+            keyword_payload_path = repo_dir / safe_keyword_filename(keyword)
+            keyword_csv_path = repo_dir / keyword_csv_filename(keyword)
 
             payload: dict | list | None = None
-            hits = -1
 
-            if keyword_file.exists():
+            if keyword_csv_path.exists() and keyword_payload_path.exists():
                 try:
-                    cached_text = keyword_file.read_text(encoding="utf-8")
-                    payload = json.loads(cached_text)
-                    if isinstance(payload, dict):
-                        hits = int(payload.get("total_count", 0) or 0)
+                    payload = json.loads(keyword_payload_path.read_text(encoding="utf-8"))
+                    filtered_items = []
+                    with open(keyword_csv_path, newline="", encoding="utf-8") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            filtered_items.append({
+                                "name": row.get("name", ""),
+                                "path": row.get("path", ""),
+                                "url": row.get("url", ""),
+                                "git_url": row.get("git_url", ""),
+                                "html_url": row.get("html_url", ""),
+                            })
+                except Exception as e:
+                    print(f"[keywords-no-test] failed to reuse cached CSV for {repo}:{keyword}: {e}",
+                          file=sys.stderr)
+                    payload = None
+                    filtered_items = []
+
+                if payload is not None:
+                    hits = len(filtered_items)
+                    query = build_repo_keyword_query(repo, keyword, extra_filter)
+                    url = build_code_search_url(query)
+                    api_url = build_api_search_url(query)
+                    if hits > 0:
+                        aggregated_rows.append((repo, keyword, hits, query, url, api_url))
+                    continue
+
+            filtered_items = []
+            if keyword_payload_path.exists():
+                try:
+                    payload = json.loads(keyword_payload_path.read_text(encoding="utf-8"))
                 except Exception as e:
                     print(f"[keywords-no-test] failed to read cached payload for {repo}:{keyword}: {e}",
                           file=sys.stderr)
                     payload = None
-                    hits = -1
 
             if payload is None:
-                hits, payload = repo_keyword_search(
+                _, payload = repo_keyword_search(
                     repo, keyword, tok, limiter_kw, extra_filter, include_payload=True
                 )
                 if payload is not None:
                     write_keyword_payload(repo_dir, keyword, payload)
 
+            filtered_items = filter_payload_items(payload)
+            if payload is not None:
+                write_keyword_items_csv(repo_dir, keyword, filtered_items)
+                hits = len(filtered_items)
+            else:
+                hits = -1
+
             query = build_repo_keyword_query(repo, keyword, extra_filter)
             url = build_code_search_url(query)
             api_url = build_api_search_url(query)
-            aggregated_rows.append((repo, keyword, hits, query, url, api_url))
+            if hits > 0:
+                aggregated_rows.append((repo, keyword, hits, query, url, api_url))
 
     out_csv = Path(a.out_keywords_no_test)
     try:
