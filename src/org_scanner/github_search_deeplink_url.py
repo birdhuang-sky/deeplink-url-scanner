@@ -615,12 +615,34 @@ def scan_keywords_without_test(a, tok):
         keywords = sorted(selections[repo])
         repo_dir = per_repo_dir / safe_repo_slug(repo)
         for keyword in keywords:
-            extra_filter = "" #"-path:test"
-            hits, payload = repo_keyword_search(repo, keyword, tok, limiter_kw, extra_filter, include_payload=True)
+            extra_filter = "-path:test"
+            keyword_file = repo_dir / safe_keyword_filename(keyword)
+
+            payload: dict | list | None = None
+            hits = -1
+
+            if keyword_file.exists():
+                try:
+                    cached_text = keyword_file.read_text(encoding="utf-8")
+                    payload = json.loads(cached_text)
+                    if isinstance(payload, dict):
+                        hits = int(payload.get("total_count", 0) or 0)
+                except Exception as e:
+                    print(f"[keywords-no-test] failed to read cached payload for {repo}:{keyword}: {e}",
+                          file=sys.stderr)
+                    payload = None
+                    hits = -1
+
+            if payload is None:
+                hits, payload = repo_keyword_search(
+                    repo, keyword, tok, limiter_kw, extra_filter, include_payload=True
+                )
+                if payload is not None:
+                    write_keyword_payload(repo_dir, keyword, payload)
+
             query = build_repo_keyword_query(repo, keyword, extra_filter)
             url = build_code_search_url(query)
             api_url = build_api_search_url(query)
-            write_keyword_payload(repo_dir, keyword, payload)
             aggregated_rows.append((repo, keyword, hits, query, url, api_url))
 
     out_csv = Path(a.out_keywords_no_test)
