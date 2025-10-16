@@ -182,7 +182,7 @@ def keyword_query_fragment(kw: str) -> str:
 
 def build_repo_keyword_query(repo: str, keyword: str, extra_filters: str = "") -> str:
     """Compose the GitHub code search query for a repo/keyword combination."""
-    parts = [f"repo:{repo}", keyword_query_fragment(keyword), 'in:file']
+    parts = [f"repo:{repo}", keyword_query_fragment(keyword)]
     extra = extra_filters.strip()
     if extra:
         parts.append(extra)
@@ -615,7 +615,7 @@ def scan_keywords_without_test(a, tok):
         keywords = sorted(selections[repo])
         repo_dir = per_repo_dir / safe_repo_slug(repo)
         for keyword in keywords:
-            extra_filter = "-path:test"
+            extra_filter = "" #"-path:test"
             hits, payload = repo_keyword_search(repo, keyword, tok, limiter_kw, extra_filter, include_payload=True)
             query = build_repo_keyword_query(repo, keyword, extra_filter)
             url = build_code_search_url(query)
