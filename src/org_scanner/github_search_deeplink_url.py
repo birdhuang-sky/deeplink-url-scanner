@@ -148,6 +148,19 @@ def load_keywords(path: Path) -> list[str]:
     print(f"[keywords] loaded {len(kws)} keywords from {path}", file=sys.stderr)
     return kws
 
+def load_repo_list(path: Path) -> list[str]:
+    repos: list[str] = []
+    if not path.exists():
+        print(f"[repos] file not found: {path}", file=sys.stderr)
+        return repos
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        repos.append(line)
+    print(f"[repos] loaded {len(repos)} repos from {path}", file=sys.stderr)
+    return repos
+
 def preload_repo_set(path: Path) -> set[str]:
     """Load pre-specified repos (one per line) OR from a CSV produced earlier.
     Accept lines like:
@@ -618,31 +631,19 @@ def scan_keywords(a, tok, repo_set):
 
 def scan_keywords_without_test(a, tok):
     """Re-scan previously matched keywords while excluding paths that contain 'test'."""
-    source_csv = Path(a.out_keywords)
-    if not source_csv.exists():
-        print(f"[keywords-no-test] source file missing: {source_csv}", file=sys.stderr)
+    repo_list = load_repo_list(Path(a.repos_file))
+    if not repo_list:
+        print("[keywords-no-test] no repos specified for no-test scan", file=sys.stderr)
         return
 
-    selections: dict[str, set[str]] = defaultdict(set)
-    with open(source_csv, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            repo = (row.get("repo") or "").strip()
-            keyword = (row.get("keyword") or "").strip()
-            hits_raw = (row.get("hits") or "0").strip()
-            if not repo or not keyword:
-                continue
-            try:
-                hits_val = int(float(hits_raw))
-            except ValueError:
-                continue
-            if hits_val <= 0:
-                continue
-            selections[repo].add(keyword)
-
-    if not selections:
-        print("[keywords-no-test] no positive-hit keywords found in source CSV", file=sys.stderr)
+    keywords = load_keywords(Path(a.keywords_file))
+    if not keywords:
+        print("[keywords-no-test] no keywords available for no-test scan", file=sys.stderr)
         return
+
+    # Deduplicate while preserving order from files
+    deduped_repos = list(dict.fromkeys(repo_list))
+    deduped_keywords = list(dict.fromkeys(keywords))
 
     effective_rate = a.rate if a.rate_mode == "total" else a.rate * max(1, len(TOKEN_LIST))
     limiter_kw = RateLimiter(limit=max(1, effective_rate), window=60)
@@ -650,10 +651,10 @@ def scan_keywords_without_test(a, tok):
     per_repo_dir = Path(a.per_repo_no_test_dir)
     repo_keyword_map: dict[str, list[tuple[str, int, str, str, str]]] = defaultdict(list)
 
-    for repo in sorted(selections.keys()):
-        keywords = sorted(selections[repo])
+    for repo in deduped_repos:
+        keywords_for_repo = deduped_keywords
         repo_dir = per_repo_dir / safe_repo_slug(repo)
-        for keyword in keywords:
+        for keyword in keywords_for_repo:
             extra_filter = "-path:test"
             keyword_payload_path = repo_dir / safe_keyword_filename(keyword)
             keyword_csv_path = repo_dir / keyword_csv_filename(keyword)
@@ -797,6 +798,8 @@ def parse_args():
                    help="Directory for per-repo keyword results excluding test paths")
     p.add_argument("--out-keywords-no-test", default="results/repo_keywords_no_test.csv",
                    help="Output CSV for keywords re-scanned with '-path:test' filter applied")
+    p.add_argument("--repos-file", default="res/repos.txt",
+                   help="List of repositories (one per line) to scan during the no-test pass")
     p.add_argument("--rate-mode", choices=["total","per-token"], default="total",
                    help="Interpret --rate as total allowed per minute (total) or per token (per-token)")
 
