@@ -1,5 +1,0 @@
-# 额外匹配的参数（每行一个）；可按需增删
-referrer
-partner_code
-distribution_id
-campaign_id

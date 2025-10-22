@@ -1,0 +1,13 @@
+Skyscanner/bellboy
+Skyscanner/bumblebee
+Skyscanner/configuration-prodpartners
+Skyscanner/egressor
+Skyscanner/egressor-tools
+Skyscanner/exit-query-dag
+Skyscanner/gitlab-github
+Skyscanner/hotels-website
+Skyscanner/mario-long-tail
+Skyscanner/redirects-service
+Skyscanner/redirects-ui
+Skyscanner/schemas
+Skyscanner/skyscanner-app
